@@ -1,5 +1,7 @@
 //! Coding agent: tools, sessions, system prompt, compaction, and CLI modes.
 
+extern crate self as pi_coding_agent;
+
 pub mod acp;
 pub mod acp_client;
 pub mod agent_session;
@@ -22,6 +24,7 @@ pub mod extensions;
 pub mod files;
 pub mod headless_commands;
 pub mod highlight;
+pub mod host;
 pub mod images;
 pub mod interactive;
 pub mod interactive_components;
@@ -51,3 +54,6 @@ pub mod tools;
 pub mod update;
 pub mod usage_cli;
 pub mod virtual_models;
+
+#[path = "../../pi-web-backend/src/lib.rs"]
+pub mod web_backend;

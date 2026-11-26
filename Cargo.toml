@@ -19,6 +19,7 @@ members = [
     "crates/pi-server",
     "crates/pi-telemetry",
     "crates/pi-tui",
+    "crates/pi-web-backend",
     "xtask",
 ]
 exclude = ["vendor/rquickjs-sys"]
@@ -38,6 +39,7 @@ pi-schema = { path = "crates/pi-schema" }
 pi-telemetry = { path = "crates/pi-telemetry" }
 anyhow = "1"
 async-trait = "0.1"
+axum = { version = "0.8", features = ["multipart"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

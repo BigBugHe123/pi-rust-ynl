@@ -312,7 +312,7 @@ impl ExtensionRunner {
     }
 
     /// Providers this runner registered, in registration order.
-    pub(crate) fn provider_ids(&self) -> Vec<String> {
+    pub fn provider_ids(&self) -> Vec<String> {
         lock(&self.providers).iter().map(|(name, _)| name.clone()).collect()
     }
 

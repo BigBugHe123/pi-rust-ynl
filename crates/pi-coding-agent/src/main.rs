@@ -342,6 +342,57 @@ fn resolve_startup_cwd(result: std::io::Result<PathBuf>) -> anyhow::Result<PathB
     })
 }
 
+fn parse_web_launch_options(raw: &[String]) -> anyhow::Result<Option<pi_coding_agent::web_backend::WebHostOptions>> {
+    if !raw.iter().any(|arg| arg == "--web") {
+        return Ok(None);
+    }
+    let (mut host, mut port) = ("0.0.0.0".to_owned(), 3030_u16);
+    let mut static_dir = None;
+    let mut index = 0;
+    while index < raw.len() {
+        let arg = raw[index].as_str();
+        if arg == "--web" {
+            index += 1;
+            continue;
+        }
+        let (name, value) =
+            if let Some((name, value)) = arg.split_once('=') { (name, Some(value.to_owned())) } else { (arg, None) };
+        match name {
+            "--host" | "--web-host" => {
+                let value = value
+                    .or_else(|| raw.get(index + 1).cloned())
+                    .ok_or_else(|| anyhow::anyhow!("{name} requires a value"))?;
+                if raw.get(index + 1).is_some_and(|_| !arg.contains('=')) {
+                    index += 1;
+                }
+                host = value;
+            }
+            "--port" | "--web-port" => {
+                let value = value
+                    .or_else(|| raw.get(index + 1).cloned())
+                    .ok_or_else(|| anyhow::anyhow!("{name} requires a value"))?;
+                if raw.get(index + 1).is_some_and(|_| !arg.contains('=')) {
+                    index += 1;
+                }
+                port = value.parse().map_err(|_| anyhow::anyhow!("Invalid web port: {value}"))?;
+            }
+            "--web-dir" | "--web-static-dir" => {
+                let value = value
+                    .or_else(|| raw.get(index + 1).cloned())
+                    .ok_or_else(|| anyhow::anyhow!("{name} requires a path"))?;
+                if raw.get(index + 1).is_some_and(|_| !arg.contains('=')) {
+                    index += 1;
+                }
+                static_dir = Some(PathBuf::from(value));
+            }
+            other => anyhow::bail!("Unknown --web option: {other}"),
+        }
+        index += 1;
+    }
+    let ip = host.parse().map_err(|_| anyhow::anyhow!("Invalid web host IP address: {host}"))?;
+    Ok(Some(pi_coding_agent::web_backend::WebHostOptions { address: std::net::SocketAddr::new(ip, port), static_dir }))
+}
+
 async fn start(raw: Vec<String>) -> anyhow::Result<i32> {
     reset_timings(pi_coding_agent::diagnostics::timings::MAIN);
     set_child_process_env("PI_CODING_AGENT", "true");
@@ -349,6 +400,18 @@ async fn start(raw: Vec<String>) -> anyhow::Result<i32> {
     if raw.iter().any(|arg| arg == "--offline") || env_flag("PI_OFFLINE") {
         set_child_process_env("PI_OFFLINE", "1");
         set_child_process_env("PI_SKIP_VERSION_CHECK", "1");
+    }
+    if let Some(options) = parse_web_launch_options(&raw)? {
+        let stop = tokio_util::sync::CancellationToken::new();
+        let shutdown = stop.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            shutdown.cancel();
+        });
+        return pi_coding_agent::web_backend::WebHost::new(Arc::new(pi_coding_agent::host::PiHost::new()))
+            .serve(options, stop)
+            .await
+            .map(|_| 0);
     }
     let agent_dir = agent_dir();
     if let Some(output) = run_completion_command(&raw, &agent_dir) {
