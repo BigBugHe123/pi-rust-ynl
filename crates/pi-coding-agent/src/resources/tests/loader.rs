@@ -52,7 +52,10 @@ fn starts_empty_and_discovers_user_skills_and_prompts() {
     let loader = load(options(&d));
     let resources = loader.resources();
     let names: Vec<&str> = resources.skills.iter().map(|skill| skill.name.as_str()).collect();
-    assert_eq!(names, ["browser-tools", "test-skill"]);
+    assert_eq!(
+        names,
+        ["browser-tools", "test-skill", "pi-extension-authoring", "pi-mcp-management", "pi-skill-authoring"]
+    );
     assert!(!resources.skill_diagnostics.iter().any(|d| d.path.as_deref().unwrap_or("").ends_with("EFFICIENCY.md")));
     assert_eq!(resources.skills[0].source_info.source, "auto");
     assert_eq!(resources.skills[0].source_info.scope, SourceScope::User);
@@ -116,7 +119,8 @@ fn honors_settings_overrides_for_auto_discovered_resources() {
     };
     let loader = load(options);
     let resources = loader.resources();
-    assert!(resources.extensions.is_empty() && resources.skills.is_empty());
+    assert!(resources.extensions.is_empty());
+    assert!(resources.skills.iter().all(|skill| skill.source_info.source == "builtin"));
     assert!(resources.prompts.is_empty() && resources.themes.is_empty());
 }
 
@@ -194,7 +198,32 @@ fn untrusted_projects_skip_protected_resources() {
     assert!(resources.append_system_prompt.is_empty());
     assert_eq!(resources.context_files.len(), 2, "context files load without trust");
     assert!(resources.extensions.is_empty() && resources.extension_diagnostics.is_empty());
-    assert!(resources.skills.is_empty() && resources.prompts.is_empty() && resources.themes.is_empty());
+    assert_eq!(resources.skills.len(), 3);
+    assert!(resources.skills.iter().all(|skill| skill.source_info.source == "builtin"));
+    assert!(resources.prompts.is_empty() && resources.themes.is_empty());
+}
+
+#[test]
+fn caches_builtin_references_and_keeps_same_named_local_skills() {
+    let d = dirs();
+    let local = d.agent.join("skills/pi-skill-authoring/SKILL.md");
+    write(&local, &skill_md("pi-skill-authoring", "Local override"));
+    let mut loader = load(options(&d));
+    let skills = &loader.resources().skills;
+    assert_eq!(skills.len(), 3);
+    assert_eq!(skills.iter().find(|skill| skill.name == "pi-skill-authoring").unwrap().file_path, local);
+    let plugin = skills.iter().find(|skill| skill.name == "pi-extension-authoring").unwrap();
+    let reference = plugin.base_dir.join("native-protocol.md");
+    let original = std::fs::read_to_string(&reference).unwrap();
+    assert!(original.contains("JSON-RPC 2.0"));
+    assert!(
+        crate::resources::expand_skill_command("/skill:pi-extension-authoring", skills)
+            .unwrap()
+            .contains("native-protocol.md")
+    );
+    std::fs::write(&reference, "incomplete cache").unwrap();
+    loader.reload();
+    assert_eq!(std::fs::read_to_string(reference).unwrap(), original);
 }
 
 #[test]

@@ -3,6 +3,7 @@
 //! `skills.ts`, `prompt-templates.ts`, `trust-manager.ts`, `project-trust.ts`, `source-info.ts`.
 
 pub mod brand;
+mod builtin_skills;
 pub mod context;
 pub mod context_entries;
 pub mod discovery;

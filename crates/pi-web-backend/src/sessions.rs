@@ -1590,7 +1590,7 @@ pub(super) async fn lease(State(state): State<AppState>, RoutePath(id): RoutePat
             let running = state.is_streaming || state.is_bash_running || state.is_compacting;
             (
                 StatusCode::OK,
-                Json(json!({"success":true, "running":running, "awaitingInput":session.ui.awaiting_input(), "subagentsActive":false})),
+                Json(json!({"success":true, "running":running, "awaitingInput":session.ui.awaiting_input(), "subagentsActive":session.ui.has_subagents()})),
             )
                 .into_response()
         }
@@ -1636,7 +1636,7 @@ async fn dispatch_rpc(web: &WebSession, mut value: Value) -> Result<Value, Strin
     if kind == "bash" {
         value["webOutput"] = json!(true);
     }
-    if kind == "extension_ui_input" {
+    if matches!(kind.as_str(), "extension_ui_input" | "extension_ui_resize") {
         value["dialogId"] = value["id"].take();
     }
     if kind == "reload" {
@@ -1754,6 +1754,7 @@ pub(super) async fn running_sessions(State(state): State<AppState>) -> Response 
     let sessions = lock(&state.sessions).iter().map(|(id, session)| (id.clone(), session.clone())).collect::<Vec<_>>();
     let mut running = Vec::new();
     let mut awaiting = Vec::new();
+    let mut subagents = Vec::new();
     for (id, session) in sessions {
         match session.is_busy().await {
             Ok(true) => running.push(id.clone()),
@@ -1761,10 +1762,13 @@ pub(super) async fn running_sessions(State(state): State<AppState>) -> Response 
             Err(error) => return failure(StatusCode::BAD_GATEWAY, format!("Could not query session {id}: {error:#}")),
         }
         if session.ui.awaiting_input() {
-            awaiting.push(id);
+            awaiting.push(id.clone());
+        }
+        if session.ui.has_subagents() {
+            subagents.push(id);
         }
     }
-    (StatusCode::OK, Json(json!({"sessionListVersion":session_list_version,"runningSessionIds": running, "awaitingInputSessionIds": awaiting,"sessionUiStateRevision":session_ui_state::revision(&state.agent_dir)}))).into_response()
+    (StatusCode::OK, Json(json!({"sessionListVersion":session_list_version,"runningSessionIds": running, "awaitingInputSessionIds": awaiting, "subagentsActiveSessionIds": subagents,"sessionUiStateRevision":session_ui_state::revision(&state.agent_dir)}))).into_response()
 }
 
 pub(super) async fn debug_snapshot(

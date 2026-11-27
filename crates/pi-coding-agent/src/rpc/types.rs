@@ -10,7 +10,7 @@ use crate::agent_session::{BashResult, StreamingBehavior};
 use crate::resources::SourceInfo;
 
 /// Every command `type`, in the order of `rpc-commands.md`.
-pub const COMMAND_TYPES: [&str; 41] = [
+pub const COMMAND_TYPES: [&str; 43] = [
     "prompt",
     "steer",
     "follow_up",
@@ -26,6 +26,8 @@ pub const COMMAND_TYPES: [&str; 41] = [
     "set_tools",
     "get_tools",
     "extension_ui_input",
+    "extension_ui_resize",
+    "extension_shortcut",
     "abort_compaction",
     "navigate_tree",
     "cycle_thinking_level",
@@ -121,6 +123,13 @@ pub enum RpcCommand {
     ExtensionUiInput {
         dialog_id: String,
         data: String,
+    },
+    ExtensionUiResize {
+        dialog_id: String,
+        columns: u16,
+    },
+    ExtensionShortcut {
+        key: String,
     },
     /// pi-rust extension: stop an active compaction.
     AbortCompaction,
@@ -336,12 +345,22 @@ pub struct RpcSessionState {
     pub steering_messages: Vec<String>,
     #[serde(default)]
     pub follow_up_messages: Vec<String>,
+    /// Shortcuts registered by the active extensions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_shortcuts: Vec<RpcExtensionShortcut>,
     /// Live MCP server state owned by this session.
     #[serde(default)]
     pub mcp_statuses: Vec<Value>,
     /// MCP configuration errors detected when this session started.
     #[serde(default)]
     pub mcp_config_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcExtensionShortcut {
+    pub key: String,
+    pub description: Option<String>,
 }
 
 /// What registered a discoverable command.
@@ -446,6 +465,6 @@ mod tests {
         );
         let failed = error(None, Some(&json!("parse")), "boom");
         assert_eq!(failed.to_string(), r#"{"type":"response","command":"parse","success":false,"error":"boom"}"#);
-        assert_eq!(COMMAND_TYPES.len(), 41);
+        assert_eq!(COMMAND_TYPES.len(), 43);
     }
 }

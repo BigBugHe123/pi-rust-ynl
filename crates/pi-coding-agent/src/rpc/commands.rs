@@ -73,6 +73,20 @@ pub fn session_state(session: &AgentSession) -> RpcSessionState {
         }),
         steering_messages: session.steering_messages(),
         follow_up_messages: session.follow_up_messages(),
+        extension_shortcuts: session
+            .extension_runner()
+            .map(|runner| {
+                runner
+                    .shortcuts()
+                    .0
+                    .into_iter()
+                    .map(|shortcut| super::types::RpcExtensionShortcut {
+                        key: shortcut.shortcut,
+                        description: shortcut.description,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         mcp_statuses: session
             .mcp_statuses()
             .into_iter()
@@ -205,6 +219,24 @@ impl RpcServer {
             RpcCommand::ExtensionUiInput { dialog_id, data } => {
                 let handled = self.ui.custom_input(&dialog_id, &data);
                 ok(id, "extension_ui_input", Some(json!({"handled": handled})))
+            }
+            RpcCommand::ExtensionUiResize { dialog_id, columns } => {
+                let handled = self.ui.resize_custom(&dialog_id, columns);
+                ok(id, "extension_ui_resize", Some(json!({"handled": handled})))
+            }
+            RpcCommand::ExtensionShortcut { key } => {
+                let handled = if let Some((runner, shortcut)) = session.extension_runner().and_then(|runner| {
+                    let shortcut = runner.shortcuts().0.into_iter().find(|entry| entry.shortcut == key)?;
+                    Some((runner, shortcut))
+                }) {
+                    tokio::spawn(
+                        async move { runner.run_shortcut(&shortcut.extension_path, &shortcut.shortcut).await },
+                    );
+                    true
+                } else {
+                    false
+                };
+                ok(id, "extension_shortcut", Some(json!({"handled": handled})))
             }
             RpcCommand::GetTools => {
                 let active = session.active_tool_names();

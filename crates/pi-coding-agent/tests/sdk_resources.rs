@@ -166,7 +166,10 @@ async fn reload_matches_upstream_order_and_the_native_loader() {
     let files: Vec<Value> =
         loaded.context_files.iter().map(|file| json!({"path": file.path, "content": file.content})).collect();
     assert_eq!(reloaded["agentsFiles"], json!(files));
-    assert_eq!(names(&reloaded["skills"]["skills"]), ["base-skill"]);
+    assert_eq!(
+        names(&reloaded["skills"]["skills"]),
+        ["base-skill", "pi-extension-authoring", "pi-mcp-management", "pi-skill-authoring"]
+    );
     assert_eq!(names(&reloaded["themes"]), ["mine"]);
     assert_eq!(reloaded["systemPrompt"], "Global system prompt.");
     assert_eq!(reloaded["source"], json!({"path": h.agent_dir.join("SYSTEM.md")}));

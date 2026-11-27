@@ -285,6 +285,7 @@ fn prompt_from_loader(root: &Path, trusted: bool) -> String {
     let mut loader = ResourceLoader::new(options);
     loader.reload();
     let mut prompt = BuildSystemPromptOptions::new(&cwd).with_resources(loader.resources());
+    prompt.skills.retain(|skill| skill.source_info.source != "builtin");
     prompt.selected_tools = vec!["read".into()];
     prompt.tool_snippets.insert("read".into(), "Read file contents".into());
     render(&prompt)

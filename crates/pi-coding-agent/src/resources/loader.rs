@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use super::brand::project_config_path;
+use super::builtin_skills::add_builtin_skills;
 use super::context::{ContextFile, load_context_files_up_to};
 use super::context_entries::ContextEntry;
 use super::discovery::{LocalResourceOptions, ResourceSettings, ResourceType, resolve_local_resources};
@@ -474,12 +475,15 @@ impl ResourceLoader {
         if self.options.no_skills && paths.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        let result = load_skills(&LoadSkillsOptions {
+        let mut result = load_skills(&LoadSkillsOptions {
             cwd: self.options.cwd.clone(),
             agent_dir: self.options.agent_dir.clone(),
             skill_paths: paths.iter().map(|path| path.display().to_string()).collect(),
             include_defaults: false,
         });
+        if !self.options.no_skills {
+            add_builtin_skills(&self.options.agent_dir, &mut result);
+        }
         (result.skills, result.diagnostics)
     }
 
