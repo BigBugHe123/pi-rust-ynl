@@ -65,11 +65,19 @@ impl WebExtensionUi {
     pub(crate) fn awaiting_input(&self) -> bool {
         !lock(&self.pending).is_empty()
     }
+    fn has_widget(&self, key: &str) -> bool {
+        lock(&self.widgets)
+            .get(key)
+            .and_then(|widget| widget["lines"].as_array())
+            .is_some_and(|lines| !lines.is_empty())
+    }
+
+    pub(crate) fn has_subagents(&self) -> bool {
+        self.has_widget("subagents")
+    }
+
     pub(crate) fn has_background_work(&self) -> bool {
-        let widgets = lock(&self.widgets);
-        ["background-tasks", "subagents"].iter().any(|key| {
-            widgets.get(*key).and_then(|widget| widget["lines"].as_array()).is_some_and(|lines| !lines.is_empty())
-        })
+        self.has_widget("background-tasks") || self.has_subagents()
     }
     pub(crate) fn statuses(&self) -> Vec<Value> {
         lock(&self.statuses).values().cloned().collect()

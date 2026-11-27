@@ -92,6 +92,72 @@ fn session_lines(root: &Path) -> Vec<Value> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn custom_panel_redraws_without_keyboard_input() {
+    let root = tempfile::tempdir().unwrap();
+    setup(root.path(), "http://127.0.0.1:9/v1");
+    let extension = root.path().join("redraw.ts");
+    std::fs::write(
+        &extension,
+        r#"
+export default (pi) => {
+  pi.registerShortcut("f9", {
+    description: "Test extension shortcut",
+    handler: (ctx) => ctx.ui.notify("Shortcut ran", "info"),
+  });
+  pi.registerCommand("panel", {
+    handler: async (_args, ctx) => {
+      await ctx.ui.custom((tui, _theme, _keys, done) => {
+        let text = "Loading";
+        let started = false;
+        return {
+          render(width) {
+            if (!started) {
+              started = true;
+              setTimeout(() => {
+                text = "Ready";
+                tui.requestRender();
+              }, 0);
+            }
+            return width === 80 ? [text] : [text, String(width)];
+          },
+          handleInput: () => done(null),
+        };
+      });
+    },
+  });
+};
+"#,
+    )
+    .unwrap();
+    let mut pi = Proc::spawn(
+        root.path(),
+        &["--model", "mock-model", "--no-session", "--extension", extension.to_str().unwrap()],
+    );
+    pi.send(json!({"id": "p", "type": "prompt", "message": "/panel"})).await;
+    let first = pi.until(|record| record["method"] == "custom").await;
+    assert_eq!(first["lines"], json!(["Loading"]));
+    let updated = pi.until(|record| record["method"] == "custom" && record["lines"] == json!(["Ready"])).await;
+    assert_eq!(updated["id"], first["id"]);
+
+    pi.send(json!({"type":"extension_ui_resize", "dialogId":first["id"], "columns":42})).await;
+    let resized = pi.until(|record| record["method"] == "custom" && record["lines"] == json!(["Ready", "42"])).await;
+    assert_eq!(resized["id"], first["id"]);
+    pi.send(json!({"type":"extension_ui_input", "dialogId":first["id"], "data":"\u{1b}"})).await;
+    pi.until(|record| record["method"] == "custom" && record["closed"] == true).await;
+
+    pi.send(json!({"id":"state", "type":"get_state"})).await;
+    assert_eq!(
+        pi.response("state").await["data"]["extensionShortcuts"],
+        json!([{"key":"f9","description":"Test extension shortcut"}])
+    );
+    pi.send(json!({"type":"extension_shortcut","key":"f9"})).await;
+    pi.until(|record| record["method"] == "notify" && record["message"] == "Shortcut ran").await;
+
+    let (code, _, stderr) = pi.close().await;
+    assert_eq!(code, Some(0), "{stderr}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn drives_a_session_and_saves_it() {
     let root = tempfile::tempdir().unwrap();
     let (url, requests) = mock_server(vec![text_body("hello")]).await;

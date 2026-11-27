@@ -16,10 +16,16 @@ use crate::session::ids::uuid_v4;
 
 type Response = Map<String, Value>;
 
+struct CustomPanel {
+    component: crate::extensions::JsComponent,
+    columns: u16,
+}
+
 /// [`ExtensionUi`] for RPC mode. Unanswered dialogs wait until their timeout or cancellation,
 /// or until the input ends.
 pub struct RpcExtensionUi {
-    custom: Mutex<HashMap<String, Arc<Mutex<crate::extensions::JsComponent>>>>,
+    custom: Mutex<HashMap<String, Arc<Mutex<CustomPanel>>>>,
+    redraw: watch::Sender<()>,
     output: RpcOutput,
     pending: Mutex<HashMap<String, oneshot::Sender<Response>>>,
     /// The number of dialogs that wait for the client, sent or held.
@@ -80,6 +86,7 @@ impl RpcExtensionUi {
         Arc::new(Self {
             output,
             custom: Mutex::new(HashMap::new()),
+            redraw: watch::channel(()).0,
             pending: Mutex::new(HashMap::new()),
             waiting: watch::channel(0).0,
             open: watch::channel(open).0,
@@ -165,11 +172,16 @@ impl RpcExtensionUi {
     pub(crate) fn custom_input(&self, id: &str, data: &str) -> bool {
         let custom = lock(&self.custom).get(id).cloned();
         let Some(custom) = custom else { return false };
-        let mut component = lock(&custom);
-        pi_tui::Component::handle_input(&mut *component, data);
-        let lines = pi_tui::Component::render(&mut *component, 80);
-        drop(component);
-        self.output.send(&json!({"type":"extension_ui_request", "id":id, "method":"custom", "lines":lines}));
+        pi_tui::Component::handle_input(&mut lock(&custom).component, data);
+        self.request_render(false);
+        true
+    }
+
+    pub(crate) fn resize_custom(&self, id: &str, columns: u16) -> bool {
+        let custom = lock(&self.custom).get(id).cloned();
+        let Some(custom) = custom else { return false };
+        lock(&custom).columns = columns.clamp(20, 240);
+        self.request_render(false);
         true
     }
 
@@ -180,17 +192,37 @@ impl RpcExtensionUi {
 
 #[async_trait]
 impl ExtensionUi for RpcExtensionUi {
+    fn request_render(&self, _force: bool) {
+        self.redraw.send_replace(());
+    }
+
     async fn custom(&self, request: crate::extensions::CustomRequest) -> Result<Option<Value>, String> {
         let id = uuid_v4();
+        let mut redraw = self.redraw.subscribe();
         let mut component = request.factory.create_async().await?;
-        let lines = pi_tui::Component::render(&mut component, 80);
-        let component = Arc::new(Mutex::new(component));
-        lock(&self.custom).insert(id.clone(), component);
+        let mut lines = pi_tui::Component::render(&mut component, 80);
+        let panel = Arc::new(Mutex::new(CustomPanel { component, columns: 80 }));
+        lock(&self.custom).insert(id.clone(), panel.clone());
         if let Some(handle_key) = request.handle_key {
             let _ = request.factory.invoke_callback(handle_key, json!(id)).await;
         }
-        self.output.send(&json!({"type":"extension_ui_request", "id":id, "method":"custom", "lines":lines}));
-        let result = request.done.await.ok();
+        self.output
+            .send(&json!({"type":"extension_ui_request", "id":id, "method":"custom", "lines":lines, "resizable":true}));
+        let mut done = request.done;
+        let result = loop {
+            tokio::select! {
+                result = &mut done => break result.ok(),
+                _ = redraw.changed() => {
+                    let mut panel = lock(&panel);
+                    let columns = usize::from(panel.columns);
+                    let updated = pi_tui::Component::render(&mut panel.component, columns);
+                    if updated != lines {
+                        self.output.send(&json!({"type":"extension_ui_request", "id":id, "method":"custom", "lines":updated, "resizable":true}));
+                        lines = updated;
+                    }
+                }
+            }
+        };
         lock(&self.custom).remove(&id);
         self.output
             .send(&json!({"type":"extension_ui_request", "id":id, "method":"custom", "lines":[], "closed":true}));
