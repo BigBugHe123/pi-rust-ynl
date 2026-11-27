@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::app_state::{AppState, WebSession, failure, lock, ok};
-use crate::rpc_worker::{RpcSessionWorker, RpcWorkerOptions, session_tool_selection};
+use crate::rpc_worker::{RpcSessionWorker, RpcWorkerOptions, SESSION_IDLE_TIMEOUT, session_tool_selection};
 use pi_coding_agent::rpc::RpcCommand;
 
 fn wrap_rpc_worker(worker: Arc<RpcSessionWorker>) -> WebSession {
@@ -15,6 +15,81 @@ async fn insert_rpc_worker(state: &AppState, worker: Arc<RpcSessionWorker>) -> W
     let id = session.session_id().await;
     lock(&state.sessions).insert(id, session.clone());
     session
+}
+
+pub(super) async fn reap_idle_sessions(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = state.stop.cancelled() => return,
+            _ = interval.tick() => {}
+        }
+        let candidates = lock(&state.sessions)
+            .iter()
+            .filter(|(_, session)| session.rpc_worker.last_activity().elapsed() >= SESSION_IDLE_TIMEOUT)
+            .map(|(id, session)| (id.clone(), session.clone()))
+            .collect::<Vec<_>>();
+        futures::StreamExt::for_each_concurrent(stream::iter(candidates), 8, |(id, session)| {
+            close_idle_session(&state, id, session)
+        })
+        .await;
+    }
+}
+
+async fn close_idle_session(state: &AppState, id: String, session: WebSession) {
+    let worker = &session.rpc_worker;
+    let last_activity = worker.last_activity();
+    if last_activity.elapsed() < SESSION_IDLE_TIMEOUT || session.ui.has_background_work() || session.ui.awaiting_input()
+    {
+        return;
+    }
+    if worker.ensure_alive().is_ok() {
+        let Ok(status) = worker.refresh_state().await else {
+            return;
+        };
+        if status.session_id != id
+            || status.is_streaming
+            || status.is_bash_running
+            || status.is_compacting
+            || status.pending_message_count != 0
+        {
+            return;
+        }
+    }
+    // Serialize reopening with disposal so two workers cannot own the same file.
+    let opening = session_opening_lock(state, &id);
+    let _opening = opening.lock().await;
+    let removed = {
+        let mut sessions = lock(&state.sessions);
+        if !sessions.get(&id).is_some_and(|current| Arc::ptr_eq(&current.rpc_worker, worker))
+            // The map and this sweep own one reference each. An active request owns another.
+            || Arc::strong_count(worker) != 2
+            || worker.last_activity() != last_activity
+            || session.ui.has_background_work()
+            || session.ui.awaiting_input()
+        {
+            return;
+        }
+        sessions.remove(&id)
+    };
+    if let Some(removed) = removed {
+        let _ = removed.events.send(json!({"type":"session_ended","sessionId":id,"reason":"idle_timeout"}));
+        removed.dispose().await;
+    }
+}
+
+fn session_opening_lock(state: &AppState, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = lock(&state.opening_sessions);
+    locks.retain(|_, weak| weak.strong_count() > 0);
+    match locks.get(id).and_then(Weak::upgrade) {
+        Some(opening) => opening,
+        None => {
+            let opening = Arc::new(tokio::sync::Mutex::new(()));
+            locks.insert(id.to_string(), Arc::downgrade(&opening));
+            opening
+        }
+    }
 }
 
 fn rpc_status_json(
@@ -43,18 +118,7 @@ async fn get_or_open(state: &AppState, id: &str) -> anyhow::Result<WebSession> {
         session.rpc_worker.ensure_alive()?;
         return Ok(session);
     }
-    let opening = {
-        let mut locks = lock(&state.opening_sessions);
-        locks.retain(|_, weak| weak.strong_count() > 0);
-        match locks.get(id).and_then(Weak::upgrade) {
-            Some(opening) => opening,
-            None => {
-                let opening = Arc::new(tokio::sync::Mutex::new(()));
-                locks.insert(id.to_string(), Arc::downgrade(&opening));
-                opening
-            }
-        }
-    };
+    let opening = session_opening_lock(state, id);
     let _opening = opening.lock().await;
     let existing = { lock(&state.sessions).get(id).cloned() };
     if let Some(session) = existing {
@@ -1114,6 +1178,11 @@ pub(super) async fn session_detail_snapshot(
     RoutePath(id): RoutePath<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    if query.get("opened").is_some_and(|value| value == "1")
+        && let Some(session) = lock(&state.sessions).get(&id)
+    {
+        session.rpc_worker.reset_idle_timer();
+    }
     let (entries, leaf_id) = match get_session_entries(&state, &id).await {
         Ok(entries) => entries,
         Err(_) => return failure(StatusCode::NOT_FOUND, "Session not found"),
@@ -1489,6 +1558,7 @@ pub(super) async fn command(
                 };
                 let mut sessions = lock(&state.sessions);
                 sessions.remove(&id);
+                session.rpc_worker.reset_idle_timer();
                 sessions.insert(new_id.to_string(), session);
                 if let Some(old_web_session) = old_web_session {
                     sessions.insert(id.clone(), old_web_session);
@@ -1715,13 +1785,16 @@ pub(super) async fn debug_snapshot(
         };
         let streaming = rpc_state.is_streaming;
         let compacting = rpc_state.is_compacting;
+        let idle_elapsed_ms = i64::try_from(web.rpc_worker.last_activity().elapsed().as_millis()).unwrap_or(i64::MAX);
+        let last_reset_at = now.saturating_sub(idle_elapsed_ms);
+        let idle_timeout_ms = SESSION_IDLE_TIMEOUT.as_secs() as i64 * 1000;
         let snapshot = json!({
             "sessionId":id,"state":"alive","stale":false,"subagent":false,"chatOnly":false,
             "createdAt":web.created_at,"startedAt":web.created_at,"closingAt":null,"extensions":"bound",
             "run":{"running":streaming || compacting,"streaming":streaming,"promptRunning":streaming,"pendingPrompts":rpc_state.pending_message_count,
                 "bashRunning":rpc_state.is_bash_running,"compacting":compacting,"retrying":false,"queuedMessages":0,"waitingForMcp":false,
                 "runningTools":0,"mutatingCommands":0,"replacement":null},
-            "idle":{"timeoutMs":0,"nextCheckAt":null,"lastResetAt":null,"forcedByStop":false},
+            "idle":{"timeoutMs":idle_timeout_ms,"nextCheckAt":last_reset_at + idle_timeout_ms,"lastResetAt":last_reset_at,"forcedByStop":false},
             "ui":{"awaitingInput":web.ui.awaiting_input(),"pendingRequests":web.ui.pending_requests().len(),"customUis":0},
             "extensionsState":"rpc"
         });

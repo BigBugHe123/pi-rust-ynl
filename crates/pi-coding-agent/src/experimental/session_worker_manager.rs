@@ -270,6 +270,25 @@ impl SessionWorkerManager {
 }
 
 impl Inner {
+    pub(super) fn idle_timeout_worker(self: &Arc<Self>, peer_id: &str, token: &str, session_key: &str) {
+        let worker = {
+            let state = lock(&self.state);
+            state
+                .workers_by_session
+                .get(session_key)
+                .filter(|worker| worker.token == token && worker.peer_id == peer_id)
+                .cloned()
+        };
+        if let Some(worker) = worker {
+            let inner = self.clone();
+            tokio::spawn(async move {
+                let _ = inner.stop_worker(&worker, &pi_chord::BACKGROUND_CONTEXT).await;
+            });
+        }
+    }
+}
+
+impl Inner {
     pub(super) fn assert_session_plugin_manifest_paths(
         &self,
         metadata: &SessionCatalogMetadata,

@@ -19,6 +19,7 @@ pub const SESSION_WORKER_SESSION_KEY_ENV: &str = "PI_SESSION_WORKER_SESSION_KEY_
 pub const SESSION_WORKER_PEER_ID_ENV: &str = "PI_SESSION_WORKER_PEER_ID";
 pub const SESSION_WORKER_INITIAL_DEMAND_GRACE_ENV: &str = "__PI_SESSION_WORKER_INITIAL_DEMAND_GRACE_MS";
 pub const SESSION_WORKER_ORPHAN_DEMAND_GRACE_ENV: &str = "__PI_SESSION_WORKER_ORPHAN_DEMAND_GRACE_MS";
+pub const SESSION_WORKER_IDLE_TIMEOUT_ENV: &str = "__PI_SESSION_WORKER_IDLE_TIMEOUT_MS";
 
 /// Options passed to a worker as its one JSON argument.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -199,7 +200,9 @@ struct LifecycleState {
     demands: HashMap<String, Demand>,
     harness_active: bool,
     current_server_connection_id: Option<String>,
+    idle_server_connection_id: Option<String>,
     initial_timer: Option<JoinHandle<()>>,
+    idle_timer: Option<JoinHandle<()>>,
     demand_initialized: bool,
     retirement_holds: usize,
     retiring: bool,
@@ -209,6 +212,8 @@ pub struct WorkerLifecycleOptions {
     pub initial_server_connection_id: Option<String>,
     pub initial_demand_grace: Duration,
     pub orphan_demand_grace: Duration,
+    pub idle_timeout: Duration,
+    pub on_idle_timeout: Box<dyn Fn() + Send + Sync>,
     pub on_retire: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -219,6 +224,8 @@ pub struct WorkerLifecycle(Arc<LifecycleInner>);
 struct LifecycleInner {
     state: Mutex<LifecycleState>,
     orphan_demand_grace: Duration,
+    idle_timeout: Duration,
+    on_idle_timeout: Box<dyn Fn() + Send + Sync>,
     on_retire: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -244,11 +251,16 @@ impl Drop for RetirementHold {
 
 impl WorkerLifecycle {
     pub fn new(options: WorkerLifecycleOptions) -> Self {
-        let state =
-            LifecycleState { current_server_connection_id: options.initial_server_connection_id, ..Default::default() };
+        let state = LifecycleState {
+            current_server_connection_id: options.initial_server_connection_id.clone(),
+            idle_server_connection_id: options.initial_server_connection_id,
+            ..Default::default()
+        };
         let inner = Arc::new(LifecycleInner {
             state: Mutex::new(state),
             orphan_demand_grace: options.orphan_demand_grace,
+            idle_timeout: options.idle_timeout,
+            on_idle_timeout: options.on_idle_timeout,
             on_retire: options.on_retire,
         });
         let weak = Arc::downgrade(&inner);
@@ -270,7 +282,12 @@ impl WorkerLifecycle {
 
     pub fn server_connected(&self, server_connection_id: &str) {
         let mut state = lock(&self.0.state);
+        let generation_changed = state.current_server_connection_id.as_deref() != Some(server_connection_id);
         state.current_server_connection_id = Some(server_connection_id.to_string());
+        state.idle_server_connection_id = Some(server_connection_id.to_string());
+        if generation_changed && let Some(timer) = state.idle_timer.take() {
+            timer.abort();
+        }
         for demand in state.demands.values_mut() {
             if demand.server_connection_id == server_connection_id
                 && let Some(timer) = demand.timer.take()
@@ -284,6 +301,7 @@ impl WorkerLifecycle {
         let mut state = lock(&self.0.state);
         if state.current_server_connection_id.as_deref() == Some(server_connection_id) {
             state.current_server_connection_id = None;
+            state.idle_server_connection_id = None;
         }
         let keys: Vec<String> = state
             .demands
@@ -328,10 +346,12 @@ impl WorkerLifecycle {
                 return Err(ChordError::error("Session worker request does not match the active attachment"));
             }
         }
+        self.cancel_idle_timer();
         Ok(self.hold_retirement())
     }
 
     pub fn hold_retirement(&self) -> RetirementHold {
+        self.cancel_idle_timer();
         lock(&self.0.state).retirement_holds += 1;
         RetirementHold { lifecycle: Some(self.clone()) }
     }
@@ -346,6 +366,7 @@ impl WorkerLifecycle {
                 return Err(ChordError::error("Session worker received demand from a stale server generation"));
             }
             state.demand_initialized = true;
+            state.idle_server_connection_id = Some(server_connection_id.to_string());
             if let Some(timer) = state.initial_timer.take() {
                 timer.abort();
             }
@@ -360,21 +381,33 @@ impl WorkerLifecycle {
                 state.demands.remove(&key);
             }
         }
+        if attached {
+            self.cancel_idle_timer();
+        }
         self.reconcile();
         Ok(())
     }
 
     /// Live Harness tasks, such as runs and compactions, hold the worker until they end.
     pub fn set_harness_active(&self, active: bool) {
-        lock(&self.0.state).harness_active = active;
-        if !active {
-            self.reconcile();
+        let was_active = {
+            let mut state = lock(&self.0.state);
+            let was_active = state.harness_active;
+            state.harness_active = active;
+            was_active
+        };
+        if was_active && !active {
+            self.cancel_idle_timer();
         }
+        self.reconcile();
     }
 
     pub fn close(&self) {
         let mut state = lock(&self.0.state);
         if let Some(timer) = state.initial_timer.take() {
+            timer.abort();
+        }
+        if let Some(timer) = state.idle_timer.take() {
             timer.abort();
         }
         for demand in state.demands.values_mut() {
@@ -386,19 +419,57 @@ impl WorkerLifecycle {
     }
 
     fn reconcile(&self) {
-        {
-            let mut state = lock(&self.0.state);
-            if state.retiring
-                || !state.demand_initialized
-                || state.retirement_holds != 0
-                || state.harness_active
-                || !state.demands.is_empty()
-            {
-                return;
+        let mut state = lock(&self.0.state);
+        if state.retiring || !state.demand_initialized || state.retirement_holds != 0 || state.harness_active {
+            if let Some(timer) = state.idle_timer.take() {
+                timer.abort();
+            }
+            return;
+        }
+        if !state.demands.is_empty() && state.idle_timer.is_none() && state.idle_server_connection_id.is_some() {
+            let weak = Arc::downgrade(&self.0);
+            let timer = tokio::spawn(async move {
+                let Some(inner) = weak.upgrade() else { return };
+                tokio::time::sleep(inner.idle_timeout).await;
+                let retire = {
+                    let mut state = lock(&inner.state);
+                    if !state.retiring
+                        && state.demand_initialized
+                        && state.idle_server_connection_id.is_some()
+                        && !state.harness_active
+                        && state.retirement_holds == 0
+                    {
+                        state.retiring = true;
+                        state.demands.clear();
+                        state.idle_timer = None;
+                        true
+                    } else {
+                        state.idle_timer = None;
+                        false
+                    }
+                };
+                if retire {
+                    (inner.on_idle_timeout)();
+                }
+            });
+            state.idle_timer = Some(timer);
+            return;
+        }
+        // Demand-free workers retain the shorter orphan/startup retirement behavior.
+        if state.demands.is_empty() {
+            if let Some(timer) = state.idle_timer.take() {
+                timer.abort();
             }
             state.retiring = true;
+            drop(state);
+            (self.0.on_retire)();
         }
-        (self.0.on_retire)();
+    }
+
+    fn cancel_idle_timer(&self) {
+        if let Some(timer) = lock(&self.0.state).idle_timer.take() {
+            timer.abort();
+        }
     }
 }
 

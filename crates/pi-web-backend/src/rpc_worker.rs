@@ -6,12 +6,16 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pi_ai::ThinkingLevel;
 use pi_coding_agent::rpc::{RpcClient, RpcClientOptions, RpcCommand, RpcSessionState};
 use serde_json::Value;
 use tokio::sync::{Mutex, RwLock, broadcast};
+
+use crate::app_state::lock;
+
+pub(crate) const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 pub(crate) struct RpcWorkerOptions {
     pub(crate) cwd: PathBuf,
@@ -31,6 +35,7 @@ pub(crate) struct RpcSessionWorker {
     pub(crate) ui: Arc<crate::web_ui::WebExtensionUi>,
     cwd: PathBuf,
     agent_dir: PathBuf,
+    last_activity: Arc<std::sync::Mutex<Instant>>,
 }
 
 #[derive(Clone, Debug)]
@@ -83,15 +88,31 @@ impl RpcSessionWorker {
         let event_sender = events.clone();
         let ui = Arc::new(crate::web_ui::WebExtensionUi::default());
         let observed = ui.clone();
+        let last_activity = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let activity = last_activity.clone();
         tokio::spawn(async move {
             while let Some(record) = records.recv().await {
+                if matches!(record["type"].as_str(), Some("agent_start" | "agent_end"))
+                    || (record["type"] == "extension_ui_request"
+                        && matches!(record["widgetKey"].as_str(), Some("background-tasks" | "subagents")))
+                {
+                    *lock(&activity) = Instant::now();
+                }
                 observed.observe(&record);
                 let _ = event_sender.send(record);
             }
             let _ = event_sender.send(serde_json::json!({"type":"server_shutdown"}));
         });
 
-        Ok(Self { client, command_lock: Mutex::new(()), state, events, ui, cwd, agent_dir })
+        Ok(Self { client, command_lock: Mutex::new(()), state, events, ui, cwd, agent_dir, last_activity })
+    }
+
+    pub(crate) fn last_activity(&self) -> Instant {
+        *lock(&self.last_activity)
+    }
+
+    pub(crate) fn reset_idle_timer(&self) {
+        *lock(&self.last_activity) = Instant::now();
     }
 
     pub(crate) async fn request(&self, command: RpcCommand) -> anyhow::Result<Value> {

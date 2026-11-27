@@ -65,6 +65,12 @@ impl WebExtensionUi {
     pub(crate) fn awaiting_input(&self) -> bool {
         !lock(&self.pending).is_empty()
     }
+    pub(crate) fn has_background_work(&self) -> bool {
+        let widgets = lock(&self.widgets);
+        ["background-tasks", "subagents"].iter().any(|key| {
+            widgets.get(*key).and_then(|widget| widget["lines"].as_array()).is_some_and(|lines| !lines.is_empty())
+        })
+    }
     pub(crate) fn statuses(&self) -> Vec<Value> {
         lock(&self.statuses).values().cloned().collect()
     }

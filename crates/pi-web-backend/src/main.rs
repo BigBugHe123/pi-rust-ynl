@@ -935,6 +935,7 @@ async fn main() -> anyhow::Result<()> {
     let app = http::router(state.clone());
     let address: SocketAddr = std::env::var("PI_WEB_BACKEND_ADDR").unwrap_or_else(|_| "0.0.0.0:3030".into()).parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;
+    tokio::spawn(sessions::reap_idle_sessions(state.clone()));
     println!("pi-web-backend listening on http://{address}");
     if let Some(static_dir) = static_files::static_dir() {
         println!("pi-web-backend serving static web files from {}", static_dir.display());

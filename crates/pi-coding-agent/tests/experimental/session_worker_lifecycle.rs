@@ -15,6 +15,8 @@ fn create_lifecycle() -> (WorkerLifecycle, Arc<AtomicUsize>) {
         initial_server_connection_id: Some(GENERATION.into()),
         initial_demand_grace: Duration::from_millis(100),
         orphan_demand_grace: Duration::from_millis(200),
+        idle_timeout: Duration::from_secs(600),
+        on_idle_timeout: Box::new(|| {}),
         on_retire: Box::new(move || {
             counter.fetch_add(1, Ordering::SeqCst);
         }),

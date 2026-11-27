@@ -22,14 +22,15 @@ use super::services::worker::create_session_worker_services;
 use super::services::worker::{SessionWorkerRuntime, SessionWorkerServices, SessionWorkerServicesOptions};
 use super::session_catalog::session_storage_path;
 use super::session_worker::{
-    SESSION_WORKER_CONTROL_ADDRESS_ENV, SESSION_WORKER_CONTROL_TOKEN_ENV, SESSION_WORKER_INITIAL_DEMAND_GRACE_ENV,
-    SESSION_WORKER_ORPHAN_DEMAND_GRACE_ENV, SESSION_WORKER_PEER_ID_ENV, SESSION_WORKER_SESSION_KEY_ENV,
-    SessionWorkerCommand, SessionWorkerEvent, SessionWorkerOptions, WorkerLifecycle, WorkerLifecycleOptions,
-    WorkerOperationResponse, WorkerOperationScope, lifecycle_delay,
+    SESSION_WORKER_CONTROL_ADDRESS_ENV, SESSION_WORKER_CONTROL_TOKEN_ENV, SESSION_WORKER_IDLE_TIMEOUT_ENV,
+    SESSION_WORKER_INITIAL_DEMAND_GRACE_ENV, SESSION_WORKER_ORPHAN_DEMAND_GRACE_ENV, SESSION_WORKER_PEER_ID_ENV,
+    SESSION_WORKER_SESSION_KEY_ENV, SessionWorkerCommand, SessionWorkerEvent, SessionWorkerOptions, WorkerLifecycle,
+    WorkerLifecycleOptions, WorkerOperationResponse, WorkerOperationScope, lifecycle_delay,
 };
 
 const DEFAULT_INITIAL_DEMAND_GRACE: Duration = Duration::from_secs(10);
 const DEFAULT_ORPHAN_DEMAND_GRACE: Duration = Duration::from_secs(30);
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Open the Session's Harness over `database_path` with its root conversation. Called while the worker
 /// holds the Session lock; on failure it closes whatever it opened.
@@ -239,6 +240,18 @@ async fn run(options: SessionWorkerOptions, create: CreateSessionWorkerHarness) 
         initial_server_connection_id,
         initial_demand_grace: lifecycle_delay(SESSION_WORKER_INITIAL_DEMAND_GRACE_ENV, DEFAULT_INITIAL_DEMAND_GRACE)?,
         orphan_demand_grace: lifecycle_delay(SESSION_WORKER_ORPHAN_DEMAND_GRACE_ENV, DEFAULT_ORPHAN_DEMAND_GRACE)?,
+        idle_timeout: lifecycle_delay(SESSION_WORKER_IDLE_TIMEOUT_ENV, DEFAULT_IDLE_TIMEOUT)?,
+        on_idle_timeout: {
+            let writer = writer.clone();
+            let token = token.clone();
+            let session_key = session_key.clone();
+            Box::new(move || {
+                let message = json!({ "type": "send", "to": "server", "payload": {
+                    "type": "session_worker_idle_timeout", "token": token, "sessionKey": session_key
+                }});
+                writer.post(&message);
+            })
+        },
         on_retire: Box::new(move || notify.notify_one()),
     });
     // Every live task, background work included, keeps the worker and its Session open.

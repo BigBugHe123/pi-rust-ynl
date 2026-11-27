@@ -44,6 +44,12 @@ impl Inner {
             CoordinatorConnectionEvent::Message { from, payload } => (from, payload),
         };
         let Some(message) = SessionWorkerEvent::parse(payload) else {
+            if payload.get("type").and_then(Value::as_str) == Some("session_worker_idle_timeout") {
+                let token = payload.get("token").and_then(Value::as_str).unwrap_or_default();
+                let session_key = payload.get("sessionKey").and_then(Value::as_str).unwrap_or_default();
+                self.idle_timeout_worker(from, token, session_key);
+                return;
+            }
             if payload.get("type").and_then(Value::as_str) == Some("operation_response") {
                 let worker = lock(&self.state).workers_by_peer.get(from).cloned();
                 if let Some(worker) = worker {
