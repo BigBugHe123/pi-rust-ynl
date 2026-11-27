@@ -357,6 +357,25 @@ async fn declares_tool_changes_between_prompts_in_system_messages() {
 }
 
 #[tokio::test]
+async fn applies_live_tool_selection_changes_between_runs() {
+    let h = session_with(Select::default()).await;
+    h.session.set_active_tools_by_name(&[]);
+    h.provider.push(FauxResponse::text("chat only"));
+    h.session.prompt("first", Vec::new()).await.unwrap();
+    assert!(h.requests().last().unwrap().tools.is_empty());
+
+    // RpcCommand::SetTools does this synchronously when the user changes the preset.
+    h.session.set_active_tools_by_name(&strings(&["read", "grep", "find", "ls"]));
+    h.provider.push(FauxResponse::text("read only"));
+    h.session.prompt("second", Vec::new()).await.unwrap();
+
+    let requests = h.requests();
+    let request = requests.last().unwrap();
+    let names: Vec<_> = request.tools.iter().map(|tool| tool.name.as_str()).collect();
+    assert_eq!(names, ["read", "grep", "find", "ls"]);
+}
+
+#[tokio::test]
 async fn turns_built_in_extensions_off_with_the_extensions_setting() {
     let on = session_with(Select::default()).await;
     let names: Vec<String> = on.session.all_tools().into_iter().map(|tool| tool.name).collect();
