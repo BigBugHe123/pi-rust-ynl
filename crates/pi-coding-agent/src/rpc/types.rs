@@ -10,7 +10,7 @@ use crate::agent_session::{BashResult, StreamingBehavior};
 use crate::resources::SourceInfo;
 
 /// Every command `type`, in the order of `rpc-commands.md`.
-pub const COMMAND_TYPES: [&str; 34] = [
+pub const COMMAND_TYPES: [&str; 41] = [
     "prompt",
     "steer",
     "follow_up",
@@ -23,6 +23,11 @@ pub const COMMAND_TYPES: [&str; 34] = [
     "cycle_model",
     "get_available_models",
     "set_thinking_level",
+    "set_tools",
+    "get_tools",
+    "extension_ui_input",
+    "abort_compaction",
+    "navigate_tree",
     "cycle_thinking_level",
     "get_available_thinking_levels",
     "set_fast_mode",
@@ -38,12 +43,14 @@ pub const COMMAND_TYPES: [&str; 34] = [
     "export_html",
     "switch_session",
     "fork",
+    "fork_branch",
     "clone",
     "get_fork_messages",
     "get_entries",
     "get_tree",
     "get_last_assistant_text",
     "set_session_name",
+    "generate_session_title",
     "get_commands",
 ];
 
@@ -101,6 +108,26 @@ pub enum RpcCommand {
     SetThinkingLevel {
         level: ThinkingLevel,
     },
+    /// pi-rust extension: select the tools available to the current session.
+    /// Omit `tool_names` to restore the configured default tool selection.
+    SetTools {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_names: Option<Vec<String>>,
+        #[serde(default = "default_true", skip_serializing_if = "is_true")]
+        persist: bool,
+    },
+    /// pi-rust extension: inspect the current tool registry and active loadout.
+    GetTools,
+    ExtensionUiInput {
+        dialog_id: String,
+        data: String,
+    },
+    /// pi-rust extension: stop an active compaction.
+    AbortCompaction,
+    /// pi-rust extension: move the current session to a tree leaf.
+    NavigateTree {
+        target_id: String,
+    },
     CycleThinkingLevel,
     GetAvailableThinkingLevels,
     /// pi-rust extension.
@@ -127,6 +154,8 @@ pub enum RpcCommand {
     Bash {
         command: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        web_output: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         exclude_from_context: Option<bool>,
     },
     AbortBash,
@@ -138,11 +167,18 @@ pub enum RpcCommand {
     SwitchSession {
         session_path: String,
     },
+    ForkBranch {
+        entry_id: Option<String>,
+        before: bool,
+    },
     Fork {
         entry_id: String,
     },
     #[serde(rename = "clone")]
-    CloneSession,
+    CloneSession {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        leaf_id: Option<String>,
+    },
     GetForkMessages,
     GetEntries {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,6 +189,8 @@ pub enum RpcCommand {
     SetSessionName {
         name: String,
     },
+    /// pi-rust extension: generate a title from the current session transcript.
+    GenerateSessionTitle,
     GetMessages,
     GetCommands,
 }
@@ -170,10 +208,18 @@ impl RpcCommand {
                 | Self::GetEntries { .. }
                 | Self::GetTree
                 | Self::GetLastAssistantText
+                | Self::GetTools
                 | Self::GetMessages
                 | Self::GetCommands
         )
     }
+}
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 /// One input line, routed by its `type`.
@@ -269,6 +315,8 @@ pub struct RpcSessionState {
     /// pi-rust extension: whether the current model has a fast mode.
     pub fast_mode_available: bool,
     pub is_streaming: bool,
+    #[serde(default)]
+    pub is_bash_running: bool,
     pub is_compacting: bool,
     pub steering_mode: QueueMode,
     pub follow_up_mode: QueueMode,
@@ -280,6 +328,20 @@ pub struct RpcSessionState {
     pub auto_compaction_enabled: bool,
     pub message_count: usize,
     pub pending_message_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<Value>,
+    #[serde(default)]
+    pub steering_messages: Vec<String>,
+    #[serde(default)]
+    pub follow_up_messages: Vec<String>,
+    /// Live MCP server state owned by this session.
+    #[serde(default)]
+    pub mcp_statuses: Vec<Value>,
+    /// MCP configuration errors detected when this session started.
+    #[serde(default)]
+    pub mcp_config_errors: Vec<String>,
 }
 
 /// What registered a discoverable command.
@@ -342,7 +404,7 @@ mod tests {
         assert_eq!(command.unwrap(), RpcCommand::SetModel { provider: "p".into(), model_id: "m".into() });
 
         let parsed = parse_input(r#"{"type":"clone","id":7}"#).unwrap();
-        assert!(matches!(parsed, InputRecord::Command { command: Ok(RpcCommand::CloneSession), .. }));
+        assert!(matches!(parsed, InputRecord::Command { command: Ok(RpcCommand::CloneSession { leaf_id: None }), .. }));
         let parsed = parse_input(r#"{"type":"prompt","message":"hi","streamingBehavior":"followUp","images":null}"#);
         let InputRecord::Command { command: Ok(RpcCommand::Prompt { streaming_behavior, images, .. }), .. } =
             parsed.unwrap()
@@ -384,6 +446,6 @@ mod tests {
         );
         let failed = error(None, Some(&json!("parse")), "boom");
         assert_eq!(failed.to_string(), r#"{"type":"response","command":"parse","success":false,"error":"boom"}"#);
-        assert_eq!(COMMAND_TYPES.len(), 34);
+        assert_eq!(COMMAND_TYPES.len(), 41);
     }
 }

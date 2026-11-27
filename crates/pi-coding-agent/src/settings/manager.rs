@@ -162,6 +162,23 @@ fn set_key(map: &mut Map<String, Value>, key: &str, value: Option<Value>) {
 
 impl SettingsManager {
     /// Settings of `<agent dir>/settings.json` and `<cwd>/.pi/settings.json`.
+    pub fn global_value(&self, key: &str) -> Option<Value> {
+        self.state().global.get(key).cloned()
+    }
+
+    pub fn project_value(&self, key: &str) -> Option<Value> {
+        self.state().project.get(key).cloned()
+    }
+
+    pub fn raw_value(&self, key: &str, scope: SettingsScope) -> Option<Value> {
+        let state = self.state();
+        match scope {
+            SettingsScope::Global => state.global.get(key),
+            SettingsScope::Project => state.project.get(key),
+        }
+        .cloned()
+    }
+
     pub fn create(cwd: &Path, agent_dir: &Path, options: SettingsOptions) -> Self {
         Self::from_storage(Arc::new(FileSettingsStorage::new(cwd, agent_dir)), options)
     }

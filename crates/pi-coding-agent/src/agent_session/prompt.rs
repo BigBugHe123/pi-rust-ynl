@@ -494,13 +494,24 @@ impl AgentSession {
     /// Clear the queued user messages and return their texts (steering, follow-up). Queued
     /// extension messages, such as background task results, stay queued.
     pub fn clear_queue(&self) -> (Vec<String>, Vec<String>) {
+        let (steering, follow_up, _) = self.clear_queue_with_images();
+        (steering, follow_up)
+    }
+
+    pub(crate) fn clear_queue_with_images(&self) -> (Vec<String>, Vec<String>, Vec<ContentBlock>) {
         let cleared = {
             let mut state = lock(&self.state);
             (std::mem::take(&mut state.steering), std::mem::take(&mut state.follow_up))
         };
-        self.agent.remove_queued(|message| matches!(message, Message::User(_)));
+        let removed = self.agent.remove_queued(|message| matches!(message, Message::User(_)));
+        let mut images = Vec::new();
+        for message in removed {
+            if let Message::User(UserMessage { content: UserContent::Blocks(blocks), .. }) = message {
+                images.extend(blocks.into_iter().filter(|block| matches!(block, ContentBlock::Image { .. })));
+            }
+        }
         self.emit_queue_update();
-        cleared
+        (cleared.0, cleared.1, images)
     }
 
     /// Move queued follow-ups to the steering queue, so they go in after the current turn's

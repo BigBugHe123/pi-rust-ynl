@@ -19,6 +19,7 @@ type Response = Map<String, Value>;
 /// [`ExtensionUi`] for RPC mode. Unanswered dialogs wait until their timeout or cancellation,
 /// or until the input ends.
 pub struct RpcExtensionUi {
+    custom: Mutex<HashMap<String, Arc<Mutex<crate::extensions::JsComponent>>>>,
     output: RpcOutput,
     pending: Mutex<HashMap<String, oneshot::Sender<Response>>>,
     /// The number of dialogs that wait for the client, sent or held.
@@ -78,6 +79,7 @@ impl RpcExtensionUi {
     fn with_dialogs_open(output: RpcOutput, open: bool) -> Arc<Self> {
         Arc::new(Self {
             output,
+            custom: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             waiting: watch::channel(0).0,
             open: watch::channel(open).0,
@@ -156,7 +158,19 @@ impl RpcExtensionUi {
             _ = cancel.cancelled() => None,
         };
         self.take_pending(&id);
+        self.output.send(&json!({"type":"extension_ui_closed","id":id}));
         response
+    }
+
+    pub(crate) fn custom_input(&self, id: &str, data: &str) -> bool {
+        let custom = lock(&self.custom).get(id).cloned();
+        let Some(custom) = custom else { return false };
+        let mut component = lock(&custom);
+        pi_tui::Component::handle_input(&mut *component, data);
+        let lines = pi_tui::Component::render(&mut *component, 80);
+        drop(component);
+        self.output.send(&json!({"type":"extension_ui_request", "id":id, "method":"custom", "lines":lines}));
+        true
     }
 
     fn fire(&self, record: Map<String, Value>) {
@@ -166,6 +180,23 @@ impl RpcExtensionUi {
 
 #[async_trait]
 impl ExtensionUi for RpcExtensionUi {
+    async fn custom(&self, request: crate::extensions::CustomRequest) -> Result<Option<Value>, String> {
+        let id = uuid_v4();
+        let mut component = request.factory.create_async().await?;
+        let lines = pi_tui::Component::render(&mut component, 80);
+        let component = Arc::new(Mutex::new(component));
+        lock(&self.custom).insert(id.clone(), component);
+        if let Some(handle_key) = request.handle_key {
+            let _ = request.factory.invoke_callback(handle_key, json!(id)).await;
+        }
+        self.output.send(&json!({"type":"extension_ui_request", "id":id, "method":"custom", "lines":lines}));
+        let result = request.done.await.ok();
+        lock(&self.custom).remove(&id);
+        self.output
+            .send(&json!({"type":"extension_ui_request", "id":id, "method":"custom", "lines":[], "closed":true}));
+        Ok(result)
+    }
+
     async fn select(&self, title: &str, options: &[String], opts: DialogOptions) -> Option<String> {
         let record = request("select", json!({"title": title, "options": options, "timeout": timeout_ms(&opts)}));
         response_value(self.dialog(opts, record).await)

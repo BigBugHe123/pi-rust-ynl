@@ -11,6 +11,7 @@ mod host;
 pub mod jsonl;
 mod output;
 mod server;
+mod session_title;
 mod tree;
 mod types;
 mod ui;

@@ -19,6 +19,7 @@ members = [
     "crates/pi-server",
     "crates/pi-telemetry",
     "crates/pi-tui",
+    "crates/pi-web-backend",
     "xtask",
 ]
 exclude = ["vendor/rquickjs-sys"]
@@ -53,6 +54,7 @@ ruzstd = "0.8"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "__rustls-tls"] }
 tokio-rustls = { version = "0.26", default-features = false }
+axum = { version = "0.8", features = ["json"] }
 webpki-roots = "1"
 icu_segmenter = { version = "2.1", default-features = false, features = ["compiled_data"] }
 

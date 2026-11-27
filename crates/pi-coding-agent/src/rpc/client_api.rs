@@ -115,6 +115,24 @@ impl RpcClient {
         self.request(RpcCommand::SetThinkingLevel { level }).await.map(drop)
     }
 
+    /// Select the tools available to the current session. Pass `None` to restore configured defaults.
+    pub async fn set_tools(&self, tool_names: Option<Vec<String>>) -> anyhow::Result<Vec<String>> {
+        self.set_tools_with_persistence(tool_names, true).await
+    }
+
+    /// Change the active tools without writing another tool-selection entry to the session file.
+    pub async fn set_tools_transient(&self, tool_names: Option<Vec<String>>) -> anyhow::Result<Vec<String>> {
+        self.set_tools_with_persistence(tool_names, false).await
+    }
+
+    async fn set_tools_with_persistence(
+        &self,
+        tool_names: Option<Vec<String>>,
+        persist: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        field(self.request(RpcCommand::SetTools { tool_names, persist }).await?, "tools")
+    }
+
     /// pi-rust extension.
     pub async fn set_fast_mode(&self, enabled: bool) -> anyhow::Result<()> {
         self.request(RpcCommand::SetFastMode { enabled }).await.map(drop)
@@ -163,7 +181,9 @@ impl RpcClient {
     /// Run a shell command; `exclude_from_context` keeps its output away from the model.
     pub async fn bash_with(&self, command: &str, exclude_from_context: bool) -> anyhow::Result<RpcBashResult> {
         let exclude_from_context = exclude_from_context.then_some(true);
-        decode(self.request(RpcCommand::Bash { command: command.into(), exclude_from_context }).await?)
+        decode(
+            self.request(RpcCommand::Bash { command: command.into(), exclude_from_context, web_output: None }).await?,
+        )
     }
 
     pub async fn abort_bash(&self) -> anyhow::Result<()> {
@@ -191,7 +211,12 @@ impl RpcClient {
 
     /// Copy the active branch into a new session; true when an extension cancelled it.
     pub async fn clone_session(&self) -> anyhow::Result<bool> {
-        field(self.request(RpcCommand::CloneSession).await?, "cancelled")
+        field(self.request(RpcCommand::CloneSession { leaf_id: None }).await?, "cancelled")
+    }
+
+    /// Clone a selected branch leaf, defaulting to the current leaf.
+    pub async fn clone_session_at(&self, leaf_id: Option<&str>) -> anyhow::Result<bool> {
+        field(self.request(RpcCommand::CloneSession { leaf_id: leaf_id.map(str::to_owned) }).await?, "cancelled")
     }
 
     pub async fn get_fork_messages(&self) -> anyhow::Result<Vec<RpcForkMessage>> {
@@ -213,6 +238,10 @@ impl RpcClient {
 
     pub async fn set_session_name(&self, name: &str) -> anyhow::Result<()> {
         self.request(RpcCommand::SetSessionName { name: name.into() }).await.map(drop)
+    }
+
+    pub async fn generate_session_title(&self) -> anyhow::Result<Value> {
+        self.request(RpcCommand::GenerateSessionTitle).await
     }
 
     pub async fn get_messages(&self) -> anyhow::Result<Vec<Message>> {

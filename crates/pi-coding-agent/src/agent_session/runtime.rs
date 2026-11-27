@@ -356,10 +356,23 @@ impl AgentSessionRuntime {
 
     /// Fork at `entry_id` into a new session. `Before` a user message returns its text.
     pub async fn fork(&self, entry_id: &str, position: ForkPosition) -> anyhow::Result<ForkResult> {
+        let previous = self.session().session_file();
+        let Some((session_manager, selected_text)) = self.prepare_fork(entry_id, position).await? else {
+            return Ok(ForkResult { cancelled: true, selected_text: None });
+        };
+        self.replace(session_manager, SessionStartReason::Fork, previous).await?;
+        Ok(ForkResult { cancelled: false, selected_text })
+    }
+
+    pub(crate) async fn prepare_fork(
+        &self,
+        entry_id: &str,
+        position: ForkPosition,
+    ) -> anyhow::Result<Option<(SessionManager, Option<String>)>> {
         let position_name = if position == ForkPosition::At { "at" } else { "before" };
         let event = serde_json::json!({"type": "session_before_fork", "entryId": entry_id, "position": position_name});
         if self.before_replace(event).await {
-            return Ok(ForkResult { cancelled: true, selected_text: None });
+            return Ok(None);
         }
         let current = self.session();
         let (target_leaf, selected_text) = {
@@ -411,13 +424,17 @@ impl AgentSessionRuntime {
             }
             manager
         };
-        self.replace(session_manager, SessionStartReason::Fork, previous).await?;
-        Ok(ForkResult { cancelled: false, selected_text })
+        Ok(Some((session_manager, selected_text)))
     }
 
     /// Copy the current branch into a new session (`/clone`, RPC `clone`).
     pub async fn clone_session(&self) -> anyhow::Result<ForkResult> {
-        let leaf = self.session().session_manager().leaf_id().map(String::from);
+        self.clone_session_at(None).await
+    }
+
+    /// Copy a selected branch leaf into a new session, defaulting to the active leaf.
+    pub async fn clone_session_at(&self, leaf_id: Option<&str>) -> anyhow::Result<ForkResult> {
+        let leaf = leaf_id.map(String::from).or_else(|| self.session().session_manager().leaf_id().map(String::from));
         let leaf = leaf.ok_or_else(|| anyhow::anyhow!("Cannot clone session: no current entry selected"))?;
         self.fork(&leaf, ForkPosition::At).await
     }

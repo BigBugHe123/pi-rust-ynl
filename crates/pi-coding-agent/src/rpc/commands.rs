@@ -53,6 +53,7 @@ pub fn session_state(session: &AgentSession) -> RpcSessionState {
         fast_mode: session.fast_mode(),
         fast_mode_available: session.fast_mode_available(),
         is_streaming: session.is_streaming(),
+        is_bash_running: session.is_bash_running(),
         is_compacting: session.is_compacting(),
         steering_mode: session.steering_mode(),
         follow_up_mode: session.follow_up_mode(),
@@ -62,6 +63,34 @@ pub fn session_state(session: &AgentSession) -> RpcSessionState {
         auto_compaction_enabled: session.auto_compaction_enabled(),
         message_count: session.with_state(|state| state.messages.len()),
         pending_message_count: session.pending_message_count(),
+        system_prompt: Some(session.system_prompt()),
+        context_usage: session.context_usage().map(|usage| {
+            json!({
+                "tokens": usage.tokens,
+                "contextWindow": usage.context_window,
+                "percent": usage.percent,
+            })
+        }),
+        steering_messages: session.steering_messages(),
+        follow_up_messages: session.follow_up_messages(),
+        mcp_statuses: session
+            .mcp_statuses()
+            .into_iter()
+            .map(|status| {
+                json!({
+                    "name": status.entry.name,
+                    "enabled": status.enabled,
+                    "lifecycle": status.lifecycle.to_string(),
+                    "state": status.state.map(|state| state.to_string()),
+                    "error": status.error,
+                    "tools": status.tools,
+                    "hasResources": status.has_resources,
+                    "oauth": status.oauth,
+                    "message": status.message,
+                })
+            })
+            .collect(),
+        mcp_config_errors: session.mcp_config_errors(),
     }
 }
 
@@ -122,8 +151,12 @@ impl RpcServer {
                 ok(id, "abort", None)
             }
             RpcCommand::ClearQueue => {
-                let (steering, follow_up) = session.clear_queue();
-                ok(id, "clear_queue", Some(json!({"steering": steering, "followUp": follow_up})))
+                let (steering, follow_up, images) = session.clear_queue_with_images();
+                let mut data = json!({"steering":steering,"followUp":follow_up});
+                if !images.is_empty() {
+                    data["images"] = json!(images);
+                }
+                ok(id, "clear_queue", Some(data))
             }
             RpcCommand::NewSession { parent_session } => {
                 let result = self.runtime.new_session(parent_session, None).await?;
@@ -155,6 +188,72 @@ impl RpcServer {
             RpcCommand::SetThinkingLevel { level } => {
                 session.set_thinking_level(level, false);
                 ok(id, "set_thinking_level", None)
+            }
+            RpcCommand::SetTools { tool_names, persist } => {
+                let names = tool_names.clone().unwrap_or_else(|| session.current_default_tools());
+                session.set_active_tools_by_name(&names);
+                if persist {
+                    let data = if let Some(names) = &tool_names {
+                        json!({"version":1, "tools":names})
+                    } else {
+                        json!({"version":1, "cleared":true})
+                    };
+                    session.session_manager().append_custom_entry("pi-web:tool-selection", Some(data))?;
+                }
+                ok(id, "set_tools", Some(json!({"tools":session.active_tool_names()})))
+            }
+            RpcCommand::ExtensionUiInput { dialog_id, data } => {
+                let handled = self.ui.custom_input(&dialog_id, &data);
+                ok(id, "extension_ui_input", Some(json!({"handled": handled})))
+            }
+            RpcCommand::GetTools => {
+                let active = session.active_tool_names();
+                let declared: std::collections::HashMap<String, String> = session
+                    .state()
+                    .tools
+                    .into_iter()
+                    .map(|tool| (tool.name().to_string(), tool.description().to_string()))
+                    .collect();
+                let hidden = session.with_tool_registry(|registry| registry.hidden_declarations().to_vec());
+                let tools = session
+                    .all_tools()
+                    .into_iter()
+                    .filter(|tool| tool.exposure != pi_agent::ToolExposure::Hidden)
+                    .map(|tool| {
+                        let mut value = json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.parameters,
+                            "promptGuidelines": tool.prompt_guidelines,
+                            "exposure": tool.exposure.as_str(),
+                            "namespace": tool.namespace,
+                            "annotations": tool.annotations,
+                            "source": tool.source,
+                            "sourcePath": tool.source_path,
+                            "active": active.contains(&tool.name),
+                            "declarationHidden": hidden.contains(&tool.name),
+                        });
+                        if let Some(description) = declared.get(&tool.name) {
+                            value["description"] = json!(description);
+                        }
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                ok(id, "get_tools", Some(json!({"tools":tools})))
+            }
+            RpcCommand::AbortCompaction => {
+                session.abort_compaction();
+                ok(id, "abort_compaction", None)
+            }
+            RpcCommand::NavigateTree { target_id } => {
+                let result = session.navigate_tree(&target_id, Default::default()).await?;
+                ok(
+                    id,
+                    "navigate_tree",
+                    Some(
+                        json!({"cancelled":result.cancelled, "aborted":result.aborted, "editorText":result.editor_text}),
+                    ),
+                )
             }
             RpcCommand::CycleThinkingLevel => {
                 let data = session.cycle_thinking_level(false).map_or(Value::Null, |level| json!({"level": level}));
@@ -192,8 +291,10 @@ impl RpcServer {
                 session.abort_retry();
                 ok(id, "abort_retry", None)
             }
-            RpcCommand::Bash { command, exclude_from_context } => {
-                let result = self.bash(&session, id, &command, exclude_from_context.unwrap_or(false)).await?;
+            RpcCommand::Bash { command, exclude_from_context, web_output } => {
+                let result = self
+                    .bash(&session, id, &command, exclude_from_context.unwrap_or(false), web_output.unwrap_or(false))
+                    .await?;
                 ok(id, "bash", Some(to_json(result)))
             }
             RpcCommand::AbortBash => {
@@ -221,6 +322,25 @@ impl RpcServer {
                 let result = self.runtime.switch_session(Path::new(&session_path), None).await?;
                 ok(id, "switch_session", Some(json!({"cancelled": result.cancelled})))
             }
+            RpcCommand::ForkBranch { entry_id, before } => {
+                let target = entry_id
+                    .or_else(|| session.session_manager().leaf_id().map(str::to_owned))
+                    .ok_or_else(|| anyhow::anyhow!("Nothing to fork"))?;
+                let position = if before { ForkPosition::Before } else { ForkPosition::At };
+                let data = match self.runtime.prepare_fork(&target, position).await? {
+                    None => json!({"cancelled":true,"byExtension":true,"cancelReason":"extension"}),
+                    Some((branch, text)) => {
+                        let path = branch
+                            .session_file()
+                            .ok_or_else(|| anyhow::anyhow!("Branch requires a persistent session"))?;
+                        if !path.exists() {
+                            branch.rewrite_file()?;
+                        }
+                        json!({"cancelled":false,"text":text,"newSessionId":branch.session_id(),"path":path})
+                    }
+                };
+                ok(id, "fork_branch", Some(data))
+            }
             RpcCommand::Fork { entry_id } => {
                 let result = self.runtime.fork(&entry_id, ForkPosition::Before).await?;
                 let mut data = json!({"cancelled": result.cancelled});
@@ -229,8 +349,8 @@ impl RpcServer {
                 }
                 ok(id, "fork", Some(data))
             }
-            RpcCommand::CloneSession => {
-                let result = self.runtime.clone_session().await?;
+            RpcCommand::CloneSession { leaf_id } => {
+                let result = self.runtime.clone_session_at(leaf_id.as_deref()).await?;
                 ok(id, "clone", Some(json!({"cancelled": result.cancelled})))
             }
             RpcCommand::GetForkMessages => {
@@ -269,6 +389,10 @@ impl RpcServer {
                 }
                 session.set_session_name(name)?;
                 ok(id, "set_session_name", None)
+            }
+            RpcCommand::GenerateSessionTitle => {
+                let result = super::session_title::generate(session.clone()).await.map_err(anyhow::Error::msg)?;
+                ok(id, "generate_session_title", Some(result))
             }
             RpcCommand::GetCommands => {
                 // Upstream binds extensions before it reads input, so the list has the skills and
@@ -384,6 +508,7 @@ impl RpcServer {
         id: Option<&Value>,
         command: &str,
         exclude_from_context: bool,
+        web_output: bool,
     ) -> anyhow::Result<RpcBashResult> {
         if let Some(host) = &self.host
             && let Some(result) = host.user_bash(session, command, exclude_from_context).await
@@ -392,7 +517,19 @@ impl RpcServer {
             return Ok(RpcBashResult::from(&result));
         }
         let event_id = id.map(|id| id.as_str().map_or_else(|| id.to_string(), String::from));
-        let result = session.execute_bash(command, exclude_from_context, event_id.as_deref(), &mut |_| {}).await?;
+        let mut tail = String::new();
+        let mut on_chunk = |chunk: &str| {
+            if web_output {
+                tail.push_str(chunk);
+                let mut start = tail.len().saturating_sub(8192);
+                while !tail.is_char_boundary(start) {
+                    start += 1;
+                }
+                tail.drain(..start);
+                self.output.send(&json!({"type":"bash_output","command":command,"output":tail}));
+            }
+        };
+        let result = session.execute_bash(command, exclude_from_context, event_id.as_deref(), &mut on_chunk).await?;
         Ok(RpcBashResult::from(&result))
     }
 }

@@ -25,6 +25,7 @@ const REFRESH_LOCK_RETRY: Duration = Duration::from_millis(100);
 /// Reads and replaces the stored text under a lock. `update` returns the text to write, if any.
 pub trait AuthStorageBackend: Send + Sync {
     fn with_lock(&self, update: &mut dyn FnMut(Option<&str>) -> Option<String>) -> Result<(), String>;
+    fn read(&self) -> Result<Option<String>, String>;
 }
 
 /// A JSON file guarded by a `<file>.lock` directory, written with mode 0600.
@@ -74,6 +75,14 @@ impl AuthStorageBackend for FileAuthStorageBackend {
         }
         Ok(())
     }
+
+    fn read(&self) -> Result<Option<String>, String> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(content) => Ok(Some(content)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -98,6 +107,10 @@ impl AuthStorageBackend for InMemoryAuthStorageBackend {
             *value = Some(next);
         }
         Ok(())
+    }
+
+    fn read(&self) -> Result<Option<String>, String> {
+        Ok(self.value.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone())
     }
 }
 
@@ -171,6 +184,25 @@ impl McpOAuthCredentialStore {
         let state =
             self.update(|states| (states.get(&key).or_else(|| states.get(&legacy_key)).cloned(), false)).ok()??;
         serde_json::from_value::<McpOAuthState>(state).ok()?.tokens
+    }
+
+    /// Returns only whether each server has a stored record and an access token.
+    /// This read-only path never creates or modifies `mcp-auth.json`.
+    pub fn statuses(&self, servers: &[(String, String)]) -> Result<Vec<(bool, bool)>, String> {
+        let states = parse_states(self.backend.read()?.as_deref())?;
+        Ok(servers
+            .iter()
+            .map(|(name, server_url)| {
+                let (key, legacy_key) = store_keys(name, server_url);
+                let state = states.get(&key).or_else(|| states.get(&legacy_key));
+                let stored = state.is_some();
+                let signed_in = state
+                    .and_then(|state| state.get("tokens"))
+                    .and_then(|tokens| tokens.get("access_token"))
+                    .is_some_and(|token| token.as_str().is_some());
+                (signed_in, stored)
+            })
+            .collect())
     }
 
     /// Whether credentials were stored. Also removes legacy state the server would take over.
