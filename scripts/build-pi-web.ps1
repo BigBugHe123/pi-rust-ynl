@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('Release', 'Debug')]
+    [ValidateSet('Release', 'FastRelease', 'Debug')]
     [string]$Configuration = 'Release',
 
     [switch]$Run,
@@ -11,18 +11,20 @@ param(
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
 $targetDir = Join-Path $workspace 'target'
-$outputDir = Join-Path $targetDir $Configuration.ToLowerInvariant()
+$profile = switch ($Configuration) {
+    'Release' { 'release' }
+    'FastRelease' { 'fast-release' }
+    'Debug' { 'dev' }
+}
+$outputName = if ($profile -eq 'dev') { 'debug' } else { $profile }
+$outputDir = Join-Path $targetDir $outputName
 
 if (-not $Run) {
     $cargoArgs = @(
-        'build', '--locked', '--target-dir', $targetDir,
+        'build', '--locked', '--target-dir', $targetDir, '--profile', $profile,
         '--package', 'pi-web-backend', '--bin', 'pi-web-backend',
         '--package', 'pi-coding-agent', '--bin', 'pi'
     )
-    if ($Configuration -eq 'Release') {
-        $cargoArgs += '--release'
-    }
-
     Push-Location -LiteralPath $workspace
     try {
         & cargo @cargoArgs
